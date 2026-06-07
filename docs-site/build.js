@@ -10,24 +10,20 @@ const DIST = path.join(__dirname, 'dist');
 // ── Navigation structure ──────────────────────────────────────────────────
 const NAV = [
   {
-    label: '阅读指南',
+    label: '架构级源码解析',
     items: [
-      { title: '项目概览', file: 'guide/overview' },
-    ],
-  },
-  {
-    label: '源码分析',
-    items: [
-      { title: '第 1 章：项目概览与架构全景', file: 'chapters/01-architecture' },
-      { title: '第 2 章：启动流程与 CLI 命令树', file: 'chapters/02-startup' },
-      { title: '第 3 章：多通道系统', file: 'chapters/03-channels' },
-      { title: '第 4 章：Agent 执行引擎', file: 'chapters/04-agent-engine' },
-      { title: '第 5 章：插件系统深解', file: 'chapters/05-plugin-system' },
-      { title: '第 6 章：多 LLM 提供商抽象', file: 'chapters/06-llm-providers' },
-      { title: '第 7 章：Skills 系统', file: 'chapters/07-skills' },
-      { title: '第 8 章：安全审计机制', file: 'chapters/08-security' },
-      { title: '第 9 章：会话与上下文管理', file: 'chapters/09-session-context' },
-      { title: '第 10 章：ACP、MCP 与语音', file: 'chapters/10-acp-mcp-voice' },
+      { title: 'Ch00 — 架构全景', file: 'chapters/00-architecture-overview' },
+      { title: 'Ch01 — Agent Runtime 主循环', file: 'chapters/01-agent-runtime-main-loop' },
+      { title: 'Ch02 — Context & Prompt 组装', file: 'chapters/02-context-prompt-assembly' },
+      { title: 'Ch03 — LLM Provider 抽象', file: 'chapters/03-llm-provider-abstraction' },
+      { title: 'Ch04 — 工具注册与调用', file: 'chapters/04-tool-registry-and-calling' },
+      { title: 'Ch05 — 记忆系统', file: 'chapters/05-memory-system' },
+      { title: 'Ch06 — 技能系统', file: 'chapters/06-skill-system' },
+      { title: 'Ch07 — Trajectory & 事件追踪', file: 'chapters/07-trajectory-event-trace' },
+      { title: 'Ch08 — Reflection & Learning', file: 'chapters/08-reflection-learning-loop' },
+      { title: 'Ch09 — Eval & Feedback', file: 'chapters/09-eval-feedback' },
+      { title: 'Ch10 — 错误处理与降级', file: 'chapters/10-error-retry-fallback' },
+      { title: 'Ch11 — 阅读路线图', file: 'chapters/11-reading-roadmap' },
     ],
   },
 ];
@@ -132,18 +128,20 @@ function processMarkdown(relFile) {
 // ── Homepage ──────────────────────────────────────────────────────────────
 const HOME_SECTIONS = [
   {
-    heading: '源码分析',
+    heading: '架构级源码解析（基于实际源码深度阅读）',
     cards: [
-      { file: 'chapters/01-architecture', label: '第 1 章：项目概览与架构全景', desc: '7 层分层架构，Gateway 是控制平面，插件是扩展骨架' },
-      { file: 'chapters/02-startup', label: '第 2 章：启动流程与 CLI 命令树', desc: 'openclaw.mjs 编译缓存 Respawn 机制，命令树懒加载' },
-      { file: 'chapters/03-channels', label: '第 3 章：多通道系统', desc: '20+ 通道以绑定-路由-Turn 三层模型统一管理' },
-      { file: 'chapters/04-agent-engine', label: '第 4 章：Agent 执行引擎', desc: 'attempt.ts（5,377 行）7 阶段执行流' },
-      { file: 'chapters/05-plugin-system', label: '第 5 章：插件系统深解', desc: '40+ 生命周期钩子，manifest→安装→加载全流程' },
-      { file: 'chapters/06-llm-providers', label: '第 6 章：多 LLM 提供商抽象', desc: 'openai-transport-stream.ts（4,313 行）统一 8 个提供商' },
-      { file: 'chapters/07-skills', label: '第 7 章：Skills 系统', desc: 'Markdown 文件即 Skill，~ 路径压缩节省 400-600 tokens' },
-      { file: 'chapters/08-security', label: '第 8 章：安全审计机制', desc: 'audit-* 14 维度审计，doctor --fix 自愈系统' },
-      { file: 'chapters/09-session-context', label: '第 9 章：会话与上下文管理', desc: 'JSONL Session Store，ContextEngine 可插拔接口' },
-      { file: 'chapters/10-acp-mcp-voice', label: '第 10 章：ACP、MCP 与语音', desc: 'ACP 桥接 Codex、MCP stdio 服务器、TTS+ASR 语音链路' },
+      { file: 'chapters/00-architecture-overview', label: 'Ch00 — 架构全景', desc: '项目定位 · 7 大模块关系 · 完整执行链路 · 与 Claude Code/OpenHands/Archon 对比矩阵' },
+      { file: 'chapters/01-agent-runtime-main-loop', label: 'Ch01 — Agent Runtime 主循环', desc: '双层 while 设计 · 工具并发执行 · steering/follow-up 队列 · 状态机生命周期' },
+      { file: 'chapters/02-context-prompt-assembly', label: 'Ch02 — Context & Prompt 组装', desc: 'Prompt Pipeline · convertToLlm() 消息转换 · Context Window 管理 · Compaction 压缩' },
+      { file: 'chapters/03-llm-provider-abstraction', label: 'Ch03 — LLM Provider 抽象', desc: 'StreamFn 统一接口 · 100+ Provider Extension · Failover 设计 · 动态 API Key 刷新' },
+      { file: 'chapters/04-tool-registry-and-calling', label: 'Ch04 — 工具注册与调用', desc: 'TypeBox Schema · parallel/sequential 执行 · beforeToolCall/afterToolCall · MCP 集成' },
+      { file: 'chapters/05-memory-system', label: 'Ch05 — 记忆系统', desc: 'sqlite-vec 向量存储 · BM25+cosine 混合检索 · RRF 融合 · Dreaming 记忆整合机制' },
+      { file: 'chapters/06-skill-system', label: 'Ch06 — 技能系统', desc: 'Markdown frontmatter Skill · ClawHub 市场 · 多来源优先级加载 · 安全扫描' },
+      { file: 'chapters/07-trajectory-event-trace', label: 'Ch07 — Trajectory & 事件追踪', desc: 'JSONL 版本化事件流 · OpenTelemetry Span 映射 · Prometheus 指标 · 轨迹重放调试' },
+      { file: 'chapters/08-reflection-learning-loop', label: 'Ch08 — Reflection & Learning', desc: '现有隐式机制分析 · Dreaming 学习回路 · 用钩子实现 Reflection 的工程方案' },
+      { file: 'chapters/09-eval-feedback', label: 'Ch09 — Eval & Feedback', desc: 'QA Lab/Matrix · LLM Judge (G-Eval) · Rule Judge · Trajectory 驱动的 Offline Eval' },
+      { file: 'chapters/10-error-retry-fallback', label: 'Ch10 — 错误处理与降级', desc: '错误分类体系 · AgentHarnessError 归一化 · 熔断器实现 · Graceful Degradation' },
+      { file: 'chapters/11-reading-roadmap', label: 'Ch11 — 阅读路线图', desc: '新人/高级/架构师三条路径 · Top 20 必看文件 · 二次开发扩展点 · 常见坑避雷' },
     ],
   },
 ];
@@ -176,18 +174,18 @@ function buildHomepage() {
     <aside class="sidebar">${sidebar}</aside>
     <main class="content">
       <div class="home-hero">
-        <h1>OpenClaw 源码分析</h1>
-        <p class="tagline">核心模块逐章拆解 · 实际源码片段 · 源码截至 2026-06-07</p>
+        <h1>OpenClaw 架构级源码分析</h1>
+        <p class="tagline">Agent Framework Architect 视角 · 深度源码解剖 · 源码截至 2026-06-07</p>
         <div class="stats">
-          <span>🔬 10 章源码深度分析</span>
+          <span>📐 12 章架构级深度分析</span>
           <span>📦 源码规模 228,000+ 行</span>
-          <span>🔗 关键类型与调用链</span>
-          <span>💡 设计决策与取舍解析</span>
+          <span>🔗 Mermaid 架构图 + 时序图</span>
+          <span>💡 与 Claude Code / OpenHands / Archon 横向对比</span>
         </div>
       </div>
 
       <div class="home-intro">
-        本站以工程师为目标读者，逐章拆解 OpenClaw 的核心模块，结合实际源码片段讲解关键类型、调用链和设计决策。所有分析基于 2026-06-07 源码快照。
+        本站从 <strong>Agent Framework Architect</strong> 视角对 OpenClaw 进行架构级源码解剖。每章均包含：Mermaid 架构/时序/类图、精确源码定位（文件路径+行号）、设计动机与 Trade-off 分析、企业落地建议、面试题（含参考答案），以及与 Claude Code / OpenAI Codex / OpenHands / Archon 的横向对比。所有分析基于对实际源码的深度阅读，源码快照截至 2026-06-07。
       </div>
 
       ${sectionsHtml}
