@@ -1,184 +1,193 @@
 # 第 1 章：项目概览与架构全景
 
-## 本章信息
-
-| | |
-|--|--|
-| **本章目标** | 建立对 OpenClaw 整体架构的准确认知 |
-| **适合读者** | 所有读者，推荐作为第一章阅读 |
-| **前置知识** | 无 |
-| **核心结论** | OpenClaw 是以 Gateway 为控制平面的 7 层多通道 AI 助手网关，通过插件系统实现无限扩展 |
+> **核心结论**：OpenClaw 是以 Gateway 为控制平面的 7 层多通道 AI 助手平台，通过插件系统实现无限扩展，以 `attempt.ts` 为执行内核编排所有子系统。
 
 ---
 
-## 核心结论
+## 项目规模
 
-**OpenClaw 是一个"以 Gateway 为核心控制平面、以插件为扩展机制"的多通道个人 AI 助手网关。** 它将 AI 助手的对话入口从单一界面扩展到 20+ 个即时通讯频道，同时通过严格的插件边界保持核心代码的精简与稳定。
+| 指标 | 数据 |
+|---|---|
+| TypeScript 源文件 | 8,000+ |
+| 代码行数 | 228,000+ 行（含测试） |
+| 测试文件 | 3,625 个 |
+| npm 子包 | 22 个（`packages/`） |
+| 官方通道插件 | 20+ |
+| 支持 LLM Provider | 8 个 |
+| 版本（源码截至） | 2026.6.2（2026-06-07） |
 
 ---
 
-## 整体分层架构
-
-OpenClaw 的代码组织清晰地体现了 7 层分层结构：
+## 7 层分层架构
 
 ```mermaid
 graph TD
-    A["CLI 层 / TUI<br>openclaw.mjs → src/cli/ → src/tui/"] --> B
-    B["Gateway 层（控制平面）<br>src/gateway/ — WebSocket + HTTP 服务器"] --> C
-    C["通道层<br>src/channels/ — 20+ 消息通道绑定"] --> D
-    D["Agent 执行层<br>src/agents/ — 嵌入式 Agent 运行时"] --> E
-    E["插件层<br>src/plugins/ — 发现、加载、Hooks、SDK"] --> F
-    F["LLM 提供商层<br>src/llm/ — 多模型统一适配"] --> G
-    G["基础设施层<br>src/infra/ / src/config/ / src/security/"]
+    L1["① CLI / TUI 层<br>openclaw.mjs → src/cli/ → src/tui/<br>Commander.js 命令树 + 终端 UI"]
+    L2["② Gateway 层（控制平面）<br>src/gateway/ — WebSocket + HTTP 服务器<br>认证 · 路由 · 会话映射 · 配置热重载"]
+    L3["③ 通道层<br>src/channels/ + extensions/<br>20+ 消息通道：Telegram/Discord/Slack/WhatsApp..."]
+    L4["④ Agent 执行层<br>src/agents/ — 嵌入式 Agent 运行时<br>attempt.ts 5377行 · RuntimePlan · Context Engine"]
+    L5["⑤ 插件层<br>src/plugins/ + src/plugin-sdk/<br>40+ 生命周期 Hooks · manifest/install/load 全流程"]
+    L6["⑥ LLM 提供商层<br>src/agents/openai-transport-stream.ts 4313行<br>Anthropic · OpenAI · Google · Azure · Mistral · Cloudflare · Copilot"]
+    L7["⑦ 基础设施层<br>src/infra/ · src/config/ · src/security/<br>日志 · 网络 · 路径管理 · 安全审计"]
+
+    L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+
+    style L2 fill:#f5e6d3,stroke:#8B4513,stroke-width:2px
+    style L4 fill:#fff3e0,stroke:#8B4513,stroke-width:2px
 ```
 
 ---
 
-## 各层职责详解
+## 关键设计原则（来自 AGENTS.md）
 
-### 层 1：CLI / TUI 层
+### 原则一：Core 保持插件无关
 
-入口文件 `openclaw.mjs` 是一个纯 JavaScript 的 Node.js 启动脚本。它在加载 TypeScript 编译产物之前完成运行时检查和编译缓存配置。
+```
+Core stays plugin-agnostic.
+No bundled ids/defaults/policy in core when manifest/registry/capability contracts work.
+```
 
-CLI 层的核心是基于 Commander.js 的命令树，注册了 `onboard`、`gateway`、`node`、`doctor`、`configure` 等命令。TUI 层（`src/tui/`）提供终端界面。
+Core 层不包含任何具体插件的 ID 或默认值。通道名（`telegram`、`discord`）、LLM Provider ID（`anthropic`、`openai`）都不在 Core 里硬编码——它们通过 manifest 声明和 Plugin Registry 动态注册。
 
-### 层 2：Gateway 层（控制平面）
+**实际意义**：可以在不修改 Core 代码的情况下，新增任意通道或 LLM Provider。
 
-`src/gateway/` 是整个系统的神经中枢，承担以下职责：
-
-- WebSocket 服务器（频道连接管理）
-- HTTP API（OpenAI 兼容接口、MCP HTTP、管理接口）
-- 认证与授权（多种认证模式）
-- 配置热重载
-- 会话管理（创建、存储、恢复）
-- 插件启动与生命周期
-
-Gateway 使用懒加载优化：
+### 原则二：插件只通过 SDK 边界访问 Core
 
 ```typescript
-// 文件路径：src/gateway/server.ts
-/**
- * Lazy public entrypoint for the gateway server implementation.
- * Keeping `server.impl` behind dynamic import lets light-weight callers import
- * server types and helpers without paying the full startup dependency graph.
- */
-export async function startGatewayServer(
-  ...args: Parameters<typeof import("./server.impl.js").startGatewayServer>
-): ReturnType<typeof import("./server.impl.js").startGatewayServer> {
-  const mod = await loadServerImpl();
-  return await mod.startGatewayServer(...args);
-}
+// 合法的插件 import（通过 SDK barrel）
+import { createTool } from "openclaw/plugin-sdk/tools";
+import { getSessionStore } from "openclaw/plugin-sdk/sessions";
+
+// 非法的插件 import（直接访问 Core 内部）
+import { sessionManager } from "openclaw/src/config/sessions/store";  // ❌ 违规
 ```
 
-这个设计让 `gateway/server.ts` 可以被轻量级调用者引入类型而不触发完整的启动依赖图。
+SDK 边界是插件隔离的技术保障。`src/plugin-sdk/` 是公开 API；`src/` 其他路径是内部实现，插件不可直接访问。
 
-### 层 3：通道层
-
-`src/channels/` 管理所有即时通讯频道的接入。每个频道以插件形式存在，通过统一的绑定接口接入 Gateway。
-
-核心目录结构：
-
-| 目录 | 职责 |
-|---|---|
-| `channels/plugins/` | 通道插件注册与管理 |
-| `channels/turn/` | 消息轮次（Turn）状态机 |
-| `channels/transport/` | 底层传输抽象 |
-| `channels/message/` | 消息对象模型 |
-| `channels/allowlists/` | 发送者白名单控制 |
-
-### 层 4：Agent 执行层
-
-`src/agents/` 是 AI 对话实际执行的地方。核心文件 `agents/embedded-agent-runner/run/attempt.ts`（5,377 行）负责编排一次完整的 Agent 执行尝试，从 Prompt 准备到 LLM 流式返回。
-
-### 层 5：插件层
-
-`src/plugins/` 实现了完整的插件生命周期管理，包括发现、安装、加载、Hooks 注册和健康检查。插件 SDK（`src/plugin-sdk/`）提供插件开发者可用的公开 API。
-
-### 层 6：LLM 提供商层
-
-`src/llm/` 提供多 LLM 提供商的统一适配，支持 Anthropic、OpenAI、Google、Azure、Mistral、Cloudflare、GitHub Copilot 等 8 个主要提供商。
-
-### 层 7：基础设施层
-
-`src/infra/`、`src/config/`、`src/security/` 构成基础设施层，提供日志、网络、路径管理、配置 I/O、安全审计等跨层通用能力。
-
----
-
-## 关键设计原则
-
-通过阅读项目的 `VISION.md` 和 `AGENTS.md`，可以提炼出 OpenClaw 的几个核心设计原则：
-
-**原则一：Core 保持插件无关**
+### 原则三：安全优先，但不扼杀能力
 
 ```
-// 文件路径：src/gateway/AGENTS.md（根 AGENTS.md 摘录）
-Core stays plugin-agnostic. No bundled ids/defaults/policy in core when
-manifest/registry/capability contracts work.
-```
-
-Core 层不应包含任何具体插件的 ID、默认值或策略，这些都通过 manifest 和 registry 合约来处理。
-
-**原则二：插件只通过 SDK 边界访问 Core**
-
-```
-Plugins cross into core only via `openclaw/plugin-sdk/*`, manifest metadata,
-injected runtime helpers, documented barrels (`api.ts`, `runtime-api.ts`).
-```
-
-**原则三：安全优先，但不扼杀能力**
-
-```
-// 文件路径：VISION.md
 Security in OpenClaw is a deliberate tradeoff: strong defaults without killing capability.
-The goal is to stay powerful for real work while making risky paths explicit and
-operator-controlled.
+The goal is to stay powerful for real work while making risky paths explicit.
 ```
+
+默认安全，旋钮显式——每个高风险配置以 `dangerously` 开头，强迫操作者做有意识的选择。
+
+### 原则四：存储统一走 SQLite（架构演进方向）
+
+```
+Storage default: SQLite only. Do not add JSON/JSONL/TXT files for OpenClaw-owned
+runtime state, caches, queues, registries, or plugin scratch data.
+```
+
+注意：当前 Session 存储仍使用 JSONL，但项目已明确将 SQLite 作为唯一默认存储目标，JSONL 是历史遗留正在迁移中。
 
 ---
 
-## 目录总览
+## 目录结构全览
 
 ```
 openclaw/
-├── openclaw.mjs          # 可执行入口（纯 JS，Node.js 检查 + 编译缓存）
-├── src/                  # TypeScript 源码主目录（5,156 个源文件）
-│   ├── acp/              # Agent Control Plane（桥接 Codex 等外部 Agent）
-│   ├── agents/           # 嵌入式 Agent 执行引擎
-│   ├── channels/         # 多通道系统（绑定/路由/分发）
-│   ├── cli/              # CLI 命令树（Commander.js）
-│   ├── config/           # 配置读写与会话存储
-│   ├── context-engine/   # 上下文引擎插件化接口
-│   ├── gateway/          # 控制平面（WebSocket/HTTP 服务器）
-│   ├── hooks/            # 全局事件钩子基础设施
-│   ├── infra/            # 网络/日志/诊断等基础设施
-│   ├── llm/              # 多 LLM 提供商统一抽象
-│   ├── mcp/              # MCP 服务器（channel bridge）
-│   ├── memory/           # 记忆文件系统
-│   ├── plugins/          # 插件生命周期管理
-│   ├── plugin-sdk/       # 插件开发者 SDK
-│   ├── security/         # 安全审计模块
-│   ├── sessions/         # 会话管理
-│   ├── skills/           # Skills 文件系统
-│   ├── talk/             # 语音对话系统
-│   ├── tts/              # 文本转语音
-│   └── tui/              # 终端 UI
-├── packages/             # 共享子包（22 个）
-├── extensions/           # 第三方通道插件（内部称为 extensions）
+├── openclaw.mjs          # 可执行入口（纯 JS：Node 版本检查 + 编译缓存 Respawn）
+├── src/                  # TypeScript 源码主目录
+│   ├── acp/              # Agent Control Plane（ACP 协议桥接 Codex 等外部 Agent）
+│   ├── agents/           # Agent 执行引擎（attempt.ts 在此）
+│   │   ├── embedded-agent-runner/run/attempt.ts   # ← 核心：5377 行
+│   │   ├── openai-transport-stream.ts             # ← 核心：4313 行
+│   │   ├── sessions/     # Agent 会话级工具（Bash/Read/Edit/Write...）
+│   │   ├── sandbox/      # 沙盒配置（Docker/bubblewrap/macOS）
+│   │   └── runtime-plan/ # RuntimePlan 类型定义
+│   ├── channels/         # 多通道系统（绑定/路由/Turn 状态机）
+│   ├── cli/              # Commander.js 命令树
+│   ├── config/           # 配置读写、Session 路径、JSONL 转录
+│   │   └── sessions/     # transcript-jsonl.ts · session-key.ts
+│   ├── context-engine/   # 可插拔上下文引擎接口（types.ts 定义契约）
+│   ├── cron/             # 定时任务（Cron Agent 调度）
+│   ├── gateway/          # WebSocket/HTTP 控制平面（含 Webhook hooks.ts）
+│   ├── hooks/            # 全局 Hook 基础设施
+│   ├── infra/            # 网络/日志/exec-approvals（执行审批）
+│   ├── llm/              # LLM 类型定义与 Provider 适配
+│   ├── mcp/              # MCP 服务器（channel-bridge.ts · tools-stdio-server.ts）
+│   ├── memory/           # MEMORY.md 文件系统（root-memory-files.ts）
+│   ├── plugins/          # 插件生命周期管理（loader · registry · hooks）
+│   ├── plugin-sdk/       # 插件开发者公开 SDK
+│   ├── routing/          # 消息路由（session-key.ts）
+│   ├── security/         # 安全审计（audit-*.ts 14 模块）
+│   ├── sessions/         # Session Key 工具函数
+│   ├── skills/           # Skill 文件系统加载
+│   ├── talk/             # 语音对话系统（TTS + ASR 编排）
+│   ├── tts/              # 文本转语音 Provider
+│   └── tui/              # 终端 UI（Ink/React）
+├── packages/             # 22 个共享子包（gateway-protocol · acp-core · model-catalog-core...）
+├── extensions/           # 第三方通道插件（telegram · discord · slack · whatsapp...）
 ├── apps/                 # 独立应用（Windows Hub 等）
-└── docs/                 # 文档源文件
+└── docs/                 # 文档源文件（publish 到 docs.openclaw.ai）
+```
+
+---
+
+## 最关键的 5 个文件
+
+| 文件 | 行数 | 角色 |
+|---|---|---|
+| `src/agents/embedded-agent-runner/run/attempt.ts` | 5,377 | Agent 执行总装配厂 |
+| `src/agents/openai-transport-stream.ts` | 4,313 | 统一 8 个 LLM Provider 的流式传输 |
+| `src/context-engine/types.ts` | 387 | 可插拔上下文引擎的接口契约 |
+| `src/agents/agent-tools.policy.ts` | ~300 | 工具权限三层栅栏的决策核心 |
+| `src/agents/runtime-plan/types.ts` | ~150 | 执行计划类型系统（ThinkLevel · FailoverReason） |
+
+---
+
+## 模块间调用关系
+
+```mermaid
+graph LR
+    CLI[CLI 命令] -->|"start gateway"| GW[Gateway Server]
+    GW -->|"InboundEvent"| AR[Auto-Reply Dispatcher]
+    AR -->|"runEmbeddedAgentAttempt()"| AT[attempt.ts]
+    AT -->|"assemble()"| CE[Context Engine]
+    AT -->|"resolveSkillsPrompt()"| SK[Skills 加载器]
+    AT -->|"registerProviderStream()"| TR[openai-transport-stream.ts]
+    AT -->|"resolveAgentToolPolicy()"| TP[Tool Policy]
+    AT -->|"appendJsonlEntrySync()"| FS[(JSONL 文件)]
+    TR -->|"HTTP/SSE/WebSocket"| LLM[(LLM API)]
+    AT -->|"Plugin Hooks"| PL[Plugin Registry]
+    GW -->|"Auth + Route"| CH[通道插件 × 20+]
+```
+
+---
+
+## 核心数据流
+
+一条用户消息从发送到回复的完整数据流：
+
+```
+用户（Telegram）
+  → extensions/telegram/src/：接收消息，封装为 InboundEvent
+  → src/gateway/：认证 + sessionKey 解析
+  → src/auto-reply/：调度到 attempt.ts
+  → src/agents/embedded-agent-runner/run/attempt.ts：
+      ├─ Context Engine.assemble() → 压缩历史消息
+      ├─ Skills 加载 → 注入 System Prompt
+      ├─ openai-transport-stream.ts → 流式调用 LLM
+      ├─ 工具执行循环（Bash/Read/Write + 沙盒）
+      └─ appendJsonlEntrySync() → 持久化到 JSONL
+  → extensions/telegram/src/：发送回复
+用户（Telegram）收到回复
 ```
 
 ---
 
 ## 小结
 
-1. OpenClaw 是 7 层分层架构，Gateway 作为控制平面统一管理所有频道连接
-2. 插件系统是扩展机制的核心，通道、LLM 提供商、工具均以插件形式接入
-3. Core 代码严格保持插件无关，通过 manifest 和 SDK 边界进行解耦
-4. 安全与能力的平衡是核心设计哲学：强默认值，但提供明确的操作旋钮
-5. 项目规模庞大（228k 行源码），但分层结构清晰，每层职责明确
+1. **7 层架构**：Gateway 是控制平面，attempt.ts 是执行内核，Plugin 系统是扩展骨架
+2. **插件无关 Core**：通道、Provider、工具都以插件形式注册，Core 不知道具体实现
+3. **两个超大文件**：`attempt.ts`（5377 行）和 `openai-transport-stream.ts`（4313 行）是项目最复杂的单体文件，理解它们等于理解 Agent 执行和 LLM 传输的全部
+4. **存储过渡期**：当前用 JSONL，架构目标是全面迁移到 SQLite
+5. **安全内嵌于架构**：`audit-*.ts` 14 个审计模块、`exec-approvals.ts` 执行审批、沙盒配置——安全不是插件，是 Core 的一部分
 
 ## 延伸阅读
 
 - [第 2 章：启动流程与 CLI 命令树](02-startup.html)
+- [第 4 章：Agent 执行引擎](04-agent-engine.html)
 - [第 5 章：插件系统深解](05-plugin-system.html)

@@ -1,307 +1,281 @@
 # 第 5 章：插件系统深解
 
-## 本章信息
-
-| | |
-|--|--|
-| **本章目标** | 理解 OpenClaw 插件系统的设计、运作方式和 40+ 生命周期钩子 |
-| **适合读者** | 想开发 OpenClaw 插件或理解其扩展机制的开发者 |
-| **前置知识** | 第 1 章、第 4 章 |
-| **核心结论** | 插件系统是 OpenClaw 的扩展骨架，以 manifest → 安装 → 加载 → Hooks 注册为流程，提供 40+ 生命周期钩子点，覆盖从 Gateway 启动到 Agent 每次工具调用 |
-
----
-
-## 核心结论
-
-**OpenClaw 的插件系统以"manifest 声明 → npm 安装 → 运行时加载 → Hooks 注册"为核心流程，对外提供 40+ 个生命周期钩子点，使插件可以介入通道接入、LLM 调用、工具执行、Session 管理等所有关键路径。** 这是 OpenClaw 保持 Core 轻量而能力强大的关键机制。
+> **核心结论**：OpenClaw 的插件系统以"manifest → 激活规划 → 运行时加载 → Hooks 注册"为完整流程，通过 `PluginRecord` 统一追踪每个插件的状态，并通过严格的 SDK 边界防止插件访问 Core 内部。
 
 ---
 
 ## 插件类型
 
-根据 `VISION.md` 的描述，OpenClaw 有两种插件风格：
-
 | 类型 | 描述 | 适用场景 |
 |---|---|---|
-| **Code 插件** | 运行 OpenClaw 插件代码 | 需要 runtime hooks、自定义 Provider、通道接入、工具扩展 |
-| **Bundle 插件** | 打包稳定的外部服务（Skills、MCP Server 等） | 功能不需要 runtime 钩子的场景 |
+| **Code 插件** | 运行 OpenClaw 插件运行时代码，可注册 Hooks | 通道接入、LLM Provider、工具扩展、自定义认证 |
+| **Bundle 插件** | 打包稳定外部服务（Skills、MCP Server） | 功能不需要 runtime 钩子的静态能力 |
 
-优先使用 Bundle 插件，接口更稳定，安全边界更清晰。
-
----
-
-## 插件目录结构
-
-```
-src/plugins/
-├── loader.ts               # 插件加载器（发现 → 验证 → 初始化）
-├── manifest.ts             # manifest 解析与验证
-├── hooks.ts                # Hook Runner（执行生命周期钩子）
-├── hook-types.ts           # 40+ 钩子类型定义
-├── hook-runner-global.ts   # 全局 Hook 执行器
-├── discovery.ts            # 插件发现（从 npm / 本地路径）
-├── runtime.ts              # 插件运行时注册表
-├── installed-plugin-index*.ts  # 已安装插件索引（10+ 文件）
-├── provider-runtime.ts     # LLM Provider 插件运行时
-├── provider-hook-runtime.ts    # Provider 级 Hook 运行时
-└── plugin-sdk/             # 插件 SDK（开发者 API）
-```
+Bundle 插件优先——接口更稳定，安全边界更清晰，启动开销更小。
 
 ---
 
-## 插件生命周期
+## 完整插件生命周期
 
 ```mermaid
 graph LR
-    A[manifest.json/manifest.json5] --> B[manifest 解析与验证]
-    B --> C{安全扫描}
-    C -->|通过| D[npm install]
-    C -->|失败| E[安装拒绝]
-    D --> F[模块解析与加载]
-    F --> G[Hooks 注册到全局 Runner]
-    G --> H[插件进入 Active 状态]
-    H --> I[生命周期钩子调用]
-    I --> J[插件卸载/更新]
-```
+    subgraph "编译时"
+        M1["manifest.json<br>声明：通道 ID · Provider ID · 工具名<br>Hook 契约 · 权限要求"]
+    end
 
-### manifest.json 结构
+    subgraph "安装时"
+        I1["npm install<br>插件包到 node_modules"]
+        I2["openclaw doctor --fix<br>manifest 校验 + 迁移"]
+    end
 
-每个插件都有一个 `manifest.json`（支持 JSON5 语法）声明其能力：
+    subgraph "激活规划"
+        P1["PluginActivationPlanner<br>src/plugins/activation-planner.ts"]
+        P2["按触发器决定加载哪些插件<br>command · provider · channel · route · capability"]
+    end
 
-```json5
-// 示例：一个通道插件的 manifest
-{
-  "name": "@openclaw/telegram",
-  "version": "1.0.0",
-  "contributes": {
-    "channels": ["telegram"],
-    "hooks": ["beforeAgentStart", "messageSending", "messageReceived"],
-    "tools": [],
-    "commands": []
-  },
-  "minHostVersion": "2026.1.0"
-}
-```
+    subgraph "运行时加载"
+        L1["manifest 注册<br>manifest-registry.ts"]
+        L2["运行时激活<br>active-runtime-registry.ts"]
+        L3["createPluginRecord()<br>loader-records.ts"]
+        L4["Hooks 注册<br>host-hooks.ts"]
+    end
 
-### 安全扫描
+    subgraph "执行阶段"
+        E1["40+ 生命周期 Hook 调用<br>onAfterAttempt · beforeToolCall..."]
+    end
 
-插件安装前会做安全扫描：
-
-```typescript
-// 文件路径：src/plugins/install-security-scan.ts
-export async function runInstallSecurityScan(
-  pluginDir: string,
-  opts: InstallSecurityScanOptions,
-): Promise<InstallSecurityScanResult> {
-  // 扫描内容：
-  // 1. 依赖列表中的已知恶意包（denylist）
-  // 2. postinstall 脚本存在性检查
-  // 3. 文件权限异常检查
-}
+    M1 --> I1 --> I2 --> P1 --> P2 --> L1 --> L2 --> L3 --> L4 --> E1
 ```
 
 ---
 
-## Hooks 系统
+## PluginRecord：插件的完整状态快照
 
-Hooks 是插件与 Core 交互的主要方式，通过 `hooks.ts` 中的 Hook Runner 执行。
-
-### 钩子分类（截至 2026-06-07）
+`PluginRecord` 是 Plugin Registry 中每个插件的内存表示，是了解插件系统的关键数据结构：
 
 ```typescript
-// 文件路径：src/plugins/hook-types.ts（部分）
-export type PluginHookName =
-  // Gateway 生命周期
-  | "gatewayStart"
-  | "gatewayStop"
-  | "cronChanged"
-
-  // 消息生命周期
-  | "messageReceived"       // 收到新消息
-  | "messageSending"        // 即将发送回复
-  | "messageSent"           // 回复已发送
-
-  // Agent 生命周期
-  | "beforeAgentStart"      // Agent 开始前（可阻止）
-  | "beforeAgentRun"        // 每次运行前
-  | "beforeAgentReply"      // 即将发送回复前（可修改内容）
-  | "beforeAgentFinalize"   // Agent 结束前
-  | "agentEnd"              // Agent 结束后
-
-  // 工具调用
-  | "beforeToolCall"        // 工具调用前（可阻止）
-  | "afterToolCall"         // 工具调用后
-
-  // LLM 调用
-  | "beforeModelResolve"    // 模型选择前（可覆盖模型）
-  | "beforePromptBuild"     // Prompt 构建前（可注入内容）
-  | "modelCallStarted"      // LLM 调用开始
-  | "modelCallEnded"        // LLM 调用结束
-  | "llmInput"              // LLM 输入可见
-  | "llmOutput"             // LLM 输出可见
-
-  // Session 生命周期
-  | "sessionStart"
-  | "sessionEnd"
-  | "beforeReset"
-
-  // 分发与路由
-  | "inboundClaim"          // 入站消息认领（决定是否响应）
-  | "beforeDispatch"        // 分发前
-  | "replyDispatch"         // 回复分发
-
-  // 压缩与维护
-  | "beforeCompaction"
-  | "afterCompaction"
-  | "compactionTimeout"
-
-  // 子 Agent
-  | "subagentSpawning"
-  | "subagentDeliveryTarget"
-
-  // 会话 Prepare/Heartbeat
-  | "agentTurnPrepare"
-  | "heartbeatPromptContribution"
-  | "replyPayloadSending";
-```
-
-### Hook 执行器
-
-```typescript
-// 文件路径：src/plugins/hooks.ts
-/**
- * Plugin Hook Runner
- * 提供带有错误处理和优先级排序的生命周期钩子执行工具。
- */
-import type { GlobalHookRunnerRegistry } from "./hook-registry.types.js";
-
-// 全局 Hook Runner 单例，由 Gateway 初始化时注入
-export function getGlobalHookRunner(): GlobalHookRunnerRegistry {
-  return globalHookRunner;
+// src/plugins/loader-records.ts（精简）
+export function createPluginRecord(params: {
+  id: string;
+  name?: string;
+  version?: string;
+  format?: PluginFormat;          // "openclaw" | "bundle" | "bundled"
+  bundleFormat?: PluginBundleFormat;
+  source: string;                 // 安装来源（npm 包名 · 本地路径）
+  origin: PluginOrigin;           // "core" | "user" | "workspace"
+  enabled: boolean;
+  activationState?: PluginActivationState;
+  channelIds?: string[];          // 该插件拥有的通道 ID 列表
+  providerIds?: string[];         // 该插件拥有的 Provider ID 列表
+  contracts?: PluginManifestContracts;
+}): PluginRecord {
+  return {
+    status: params.enabled ? "loaded" : "disabled",
+    toolNames: [],                // 注册后填充
+    hookNames: [],                // 注册后填充
+    channelIds: [...(params.channelIds ?? [])],
+    providerIds: [...(params.providerIds ?? [])],
+    // 各类 Provider 的 ID 列表（按能力分类）
+    speechProviderIds: [...(params.contracts?.speechProviders ?? [])],
+    imageGenerationProviderIds: [...(params.contracts?.imageGenerationProviders ?? [])],
+    webSearchProviderIds: [...(params.contracts?.webSearchProviders ?? [])],
+    // ... 共 15+ 类 Provider 分类
+  };
 }
 ```
 
-钩子执行器支持：
-- 优先级排序（插件可声明执行优先级）
-- 超时保护（防止单个钩子阻塞整个流程）
-- 错误隔离（单个钩子失败不影响其他钩子）
-- 决策钩子（`beforeAgentStart` 等可返回 `block` 决定阻止操作）
+**为什么 `status: "disabled"` 的插件也会进入 Registry？**
 
-### 决策钩子示例
-
-```typescript
-// 文件路径：src/plugins/hook-decision-types.ts
-export type InputGateDecision = "allow" | "block";
-
-export type GateHookResult = {
-  decision: InputGateDecision;
-  /** 当 decision 为 "block" 时显示给用户的消息 */
-  blockMessage?: string;
-};
-
-// 插件可以通过 beforeAgentStart 钩子阻止 Agent 执行：
-export function resolveBlockMessage(result: GateHookResult): string | undefined {
-  if (result.decision === "block") {
-    return result.blockMessage ?? "此操作已被插件阻止";
-  }
-}
-```
+禁用的插件仍然记录在 Registry 中，这样 `openclaw doctor` 可以解释"为什么某个通道不可用"——不是"找不到这个插件"，而是"这个插件已禁用"。提供更友好的诊断信息。
 
 ---
 
-## Provider 插件接口
-
-插件可以注册自定义的 LLM Provider：
+## 激活规划器：按需加载插件
 
 ```typescript
-// 文件路径：src/plugins/provider-hook-runtime.ts
-export type ProviderRuntimePluginHandle = {
+// src/plugins/activation-planner.ts
+// 触发器类型：什么情况下需要激活哪些插件
+export type PluginActivationPlannerTrigger =
+  | { kind: "command";     command: string }    // 用户运行 openclaw <cmd>
+  | { kind: "provider";    provider: string }   // 配置里用了某个 Provider
+  | { kind: "channel";     channel: string }    // 某个通道要连接
+  | { kind: "route";       route: string }      // HTTP 路由被访问
+  | { kind: "capability";  capability: PluginManifestActivationCapability };
+
+// 激活计划条目（包含激活原因，便于诊断）
+export type PluginActivationPlanEntry = {
   pluginId: string;
-  // Provider 可以贡献：
-  // - 系统 Prompt 扩展
-  // - 文本转换（输入/输出过滤）
-  // - 工具调用参数编码方式
-  // - 模型兼容性配置
+  origin: PluginOrigin;
+  reasons: readonly PluginActivationPlannerReason[];
 };
 
-export async function resolveProviderRuntimePluginHandle(
-  pluginMetadataSnapshot: PluginMetadataSnapshot,
-  providerId: string,
-): Promise<ProviderRuntimePluginHandle | null> {
-  // 查找注册了该 providerId 的插件
-}
+export type PluginActivationPlannerReason =
+  | "manifest-channel-owner"     // manifest 声明了 channelIds
+  | "manifest-command-alias"     // manifest 声明了 CLI 命令别名
+  | "manifest-provider-owner"    // manifest 声明了 providerIds
+  | "activation-channel-hint"    // 用户配置了该通道
+  | "activation-provider-hint";  // 用户配置了该 Provider
+```
+
+**按需加载的意义**：如果用户只配置了 Telegram，Discord 插件就不会被激活——减少内存占用，缩短启动时间，降低攻击面。
+
+---
+
+## Plugin Hooks：40+ 生命周期钩子点
+
+通过 `src/plugins/host-hooks.ts` 定义的主要 Hook 类别：
+
+```typescript
+// 会话扩展（插件可以往 Session 里存储自己的数据）
+export type PluginSessionExtensionRegistration = {
+  namespace: string;
+  description: string;
+  project?: (ctx: PluginSessionExtensionProjectionContext) => PluginJsonValue | undefined;
+  cleanup?: (ctx: { reason: PluginHostCleanupReason }) => void | Promise<void>;
+  sessionEntrySlotKey?: string;     // 在 SessionEntry 里的槽位 key
+  sessionEntrySlotSchema?: PluginJsonValue;  // 槽位 JSON Schema
+};
+
+// 工具策略（插件可以决定是否允许某个工具调用）
+export type PluginTrustedToolPolicyRegistration = {
+  id: string;
+  description: string;
+  evaluate: (
+    event: PluginHookBeforeToolCallEvent,
+    ctx: PluginHookToolContext,
+  ) => PluginToolPolicyDecision | void | Promise<PluginToolPolicyDecision | void>;
+};
+
+// 工具元数据（为工具添加显示名称、描述、风险级别）
+export type PluginToolMetadataRegistration = {
+  toolName: string;
+  displayName?: string;
+  description?: string;
+  risk?: "low" | "medium" | "high";
+  tags?: string[];
+};
+
+// 控制 UI 描述符（插件可以添加控制面板按钮）
+export type PluginControlUiDescriptor = {
+  id: string;
+  surface: "session" | "tool" | "run" | "settings";
+  label: string;
+  schema?: PluginJsonValue;         // 按钮的参数 Schema
+  requiredScopes?: OperatorScope[];
+};
+
+// Agent 会话调度任务（插件可以注册定期任务）
+export type PluginSessionSchedulerJobRegistration = {
+  id: string;
+  cronExpression: string;           // Cron 表达式
+  handler: (ctx: JobContext) => Promise<void>;
+};
 ```
 
 ---
 
-## 插件 SDK
-
-`src/plugin-sdk/` 提供给插件开发者的公开 API：
+## SDK 边界：插件如何访问 Core
 
 ```typescript
-// 文件路径：src/plugin-sdk/agent-core.ts
-// 插件可使用的 Agent 相关 API
-export { /* Agent 相关 API */ } from "@openclaw/plugin-sdk/agent-core";
+// ✅ 合法的插件 import（通过 SDK barrel）
+import { createTool } from "openclaw/plugin-sdk/tools";
+import { getSessionStore } from "openclaw/plugin-sdk/sessions";
+import { registerProvider } from "openclaw/plugin-sdk/providers";
 
-// 文件路径：src/plugin-sdk/agent-harness-runtime.ts
-// 插件 Harness（Agent 执行框架）运行时 API
+// ❌ 非法的插件 import（违反边界）
+import { sessionManager } from "openclaw/src/config/sessions/store";
+import { tryApproveExec } from "openclaw/src/infra/exec-approvals";
 ```
 
-SDK 的边界规则：
-- 插件只能通过 `@openclaw/plugin-sdk/*` 访问 Core
-- 禁止直接导入 `src/**`（内部实现）
-- 禁止跨插件直接引用其他插件的 `src/**`
+SDK 边界不仅是代码规范，还有构建工具的检查：
+
+```
+// AGENTS.md 的架构规则
+Plugin prod code: no core src/**, src/plugin-sdk-internal/**, other plugin src/**,
+or relative outside package.
+```
 
 ---
 
-## 插件状态追踪
+## 插件注册的能力分类
+
+一个插件可以同时注册多类能力：
 
 ```typescript
-// 文件路径：src/plugins/plugin-lifecycle-trace.ts
-export type PluginLifecyclePhase =
-  | "discovery"
-  | "manifest-parse"
-  | "security-scan"
-  | "install"
-  | "load"
-  | "register"
-  | "active"
-  | "error"
-  | "unloaded";
+// src/plugins/registry-types.ts 定义的 PluginRecord 字段（精简）
+export type PluginRecord = {
+  // 通信能力
+  channelIds: string[];                     // 通道（Telegram/Discord/Slack）
+  // LLM 能力
+  providerIds: string[];                    // 文本生成 Provider
+  speechProviderIds: string[];             // TTS（文本转语音）
+  imageGenerationProviderIds: string[];    // 图像生成
+  videoGenerationProviderIds: string[];    // 视频生成
+  musicGenerationProviderIds: string[];    // 音乐生成
+  webSearchProviderIds: string[];          // 网络搜索
+  webFetchProviderIds: string[];           // 网页抓取
+  // 数据能力
+  embeddingProviderIds: string[];          // 向量嵌入
+  memoryEmbeddingProviderIds: string[];    // 记忆嵌入
+  // 工具能力
+  toolNames: string[];                     // 注册的工具名
+  hookNames: string[];                     // 注册的 Hook 名
+  // 服务能力
+  services: PluginServiceRecord[];         // 插件后台服务
+  cliCommands: PluginCliCommandRecord[];   // CLI 子命令
+  // 其他
+  contextEngineIds: string[];              // Context Engine 实现
+  agentHarnessIds: string[];               // Agent Harness 实现
+};
 ```
-
-插件在整个生命周期中经历这些阶段，Gateway 可以通过 `/status` 接口查询当前所有插件的状态。
 
 ---
 
-## 嵌入式插件（Bundled Plugins）
-
-OpenClaw 内置了一批"打包插件"，这些插件无需安装即可使用：
+## 插件兼容性检测
 
 ```typescript
-// 文件路径：src/plugins/bundled-plugin-scan.ts
-// 扫描发行包中预置的插件目录
-export async function scanBundledPlugins(
-  bundledPluginsDir: string,
-): Promise<BundledPluginEntry[]> {
-  // 扫描 dist/plugins/ 目录下的内置插件
-}
+// src/plugins/compat/registry.ts
+// 兼容性问题码（用于 openclaw doctor 诊断）
+export type PluginCompatCode =
+  | "sdk-version-mismatch"          // SDK 版本不兼容
+  | "node-version-too-old"          // Node.js 版本不满足插件要求
+  | "deprecated-hook"               // 使用了已废弃的 Hook
+  | "missing-required-config";      // 缺少必要配置
 ```
 
-内置插件包括主流通道（Telegram、Discord、WhatsApp 等）和一些核心能力扩展。
+`openclaw doctor` 会读取所有插件的 `compat` 字段，将不兼容问题以清晰的修复建议展示给用户。
+
+---
+
+## 内置插件 vs 外部插件
+
+OpenClaw 有两类插件的物理分布不同：
+
+| 类型 | 位置 | 加载方式 | 说明 |
+|---|---|---|---|
+| **内置捆绑插件** | `dist/` 内打包 | 直接 import | 核心通道（CLI 通道等） |
+| **外部官方插件** | 独立 npm 包 | Registry 发现 + 安装 | Telegram/Discord/Slack... |
+| **用户自定义插件** | 用户 npm 安装 | Registry 发现 + 加载 | 第三方扩展 |
+
+```
+// AGENTS.md 中的分发规则
+Internal bundled plugins ship in core dist; bundled-only facade loader ok only for them.
+External official plugins own package/deps and are excluded from core dist;
+core uses registry-aware facade-runtime or generic contracts.
+```
 
 ---
 
 ## 小结
 
-1. 插件系统是 OpenClaw 扩展能力的核心，通道、LLM Provider、工具都以插件形式接入
-2. 生命周期钩子覆盖 40+ 个关键点，从 Gateway 启动到每次工具调用
-3. 决策钩子（block/allow）允许插件介入并阻止操作，是安全控制的重要机制
-4. 插件 SDK 严格限制了插件与 Core 的交互边界，保护 Core 代码不被直接依赖
-5. 插件安装前有安全扫描，并通过 manifest 声明能力需求
+1. **manifest → 激活 → 加载 → Hooks** 是插件的完整生命周期，每个阶段有独立的代码模块负责
+2. **PluginRecord** 是插件状态的唯一真相来源，包含 15+ 类 Provider 能力分类和状态字段
+3. **激活规划器**按需加载插件——用户只配置了 Telegram，Discord 插件不会激活，减少启动开销
+4. **SDK 边界**是插件安全隔离的技术保障，通过构建工具强制检查，不可通过"聪明"的 import 绕过
+5. **40+ Hooks** 覆盖从会话扩展到工具策略的完整生命周期，使插件能干预 Agent 执行的每个关键节点
 
 ## 延伸阅读
 
+- [第 4 章：Agent 执行引擎](04-agent-engine.html)
 - [第 6 章：多 LLM 提供商抽象](06-llm-providers.html)
-- [第 7 章：Skills 系统](07-skills.html)
-- [第 10 章：ACP、MCP 与语音](10-acp-mcp-voice.html)
+- [第 8 章：安全审计机制](08-security.html)

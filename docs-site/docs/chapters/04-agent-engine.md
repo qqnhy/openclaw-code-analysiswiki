@@ -1,148 +1,101 @@
 # 第 4 章：Agent 执行引擎
 
-## 本章信息
-
-| | |
-|--|--|
-| **本章目标** | 深入理解一次 AI 对话请求从接收到回复的完整执行过程 |
-| **适合读者** | 对 Agent 工作机制、LLM 调用链路感兴趣的开发者 |
-| **前置知识** | 第 3 章 |
-| **核心结论** | Agent 执行引擎的核心是 5377 行的 `attempt.ts`，它在单次函数调用中编排了 Prompt 构建、上下文压缩、LLM 流式调用、工具执行、会话持久化等完整流水线 |
+> **核心结论**：`attempt.ts`（5,377 行）是 OpenClaw 的执行总装配厂，以"总装车间"模式编排 70+ 个子系统，完成 7 个阶段的完整执行流水线：准备→上下文装配→Prompt 组装→工具注册→LLM 流式调用→工具循环→持久化。
 
 ---
 
-## 核心结论
+## attempt.ts 的角色定位
 
-**嵌入式 Agent 执行引擎以 `attempt.ts` 为核心，在单次尝试（Attempt）内完成 Prompt 组装、技能注入、LLM 流式调用、工具执行循环和会话持久化的全部工作。** 该文件是整个项目最复杂的单体文件（5,377 行），集中体现了 OpenClaw 的 Agent 执行哲学。
+`attempt.ts` 不实现任何具体业务逻辑，它只做一件事：**按正确顺序调用所有子系统**。这是"总装车间（Assembly Plant）"模式：
 
----
-
-## 执行引擎目录结构
-
-```
-src/agents/
-├── embedded-agent-runner/
-│   ├── run/
-│   │   ├── attempt.ts          # 核心：单次执行尝试（5377 行）
-│   │   └── ...
-│   └── ...
-├── sessions/
-│   ├── session-manager.ts      # 会话状态管理器
-│   ├── keybindings.ts          # 键绑定
-│   └── package-manager.ts      # 包管理器检测
-├── sandbox/                    # 沙盒隔离
-│   └── config.ts               # 沙盒配置
-├── harness/                    # Agent 钩子执行框架
-├── modes/                      # Agent 运行模式
-├── runtime/                    # Agent 运行时接口
-└── tools/                      # 内置工具集
+```mermaid
+graph TB
+    AT["attempt.ts<br>5,377行"]
+    AT --> CE["Context Engine<br>src/context-engine/"]
+    AT --> SK["Skills 加载器<br>src/skills/"]
+    AT --> TP["Tool Policy<br>agent-tools.policy.ts"]
+    AT --> TR["LLM Transport<br>openai-transport-stream.ts"]
+    AT --> SB["Sandbox<br>src/agents/sandbox/"]
+    AT --> SM["Session Manager<br>transcript-jsonl.ts"]
+    AT --> PH["Plugin Hooks<br>src/plugins/"]
+    AT --> ACP["ACP Bridge<br>src/acp/"]
+    AT --> TRJ["Trajectory Recorder<br>src/trajectory/"]
+    AT --> HB["Heartbeat<br>src/infra/heartbeat-summary.ts"]
 ```
 
 ---
 
-## attempt.ts 的职责概览
+## 7 阶段执行流水线
 
-`attempt.ts` 通过一个庞大的函数 `runEmbeddedAgentAttempt()` 编排整个 Agent 执行尝试。从其导入列表可以看出它直接依赖的子系统：
+### 阶段 1：准备阶段（Locking + Config）
 
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts（前 100 行 import）
-import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
-import { buildHierarchyReinforcementMessage } from "../../../auto-reply/handoff-summarizer.js";
-import { getRuntimeConfig } from "../../../config/config.js";
-import { loadSessionStore, updateSessionStoreEntry } from "../../../config/sessions/store.js";
-import { resolveContextEngineOwnerPluginId } from "../../../context-engine/registry.js";
-import { createCodexNativeWebSearchWrapper } from "../../../llm/providers/stream-wrappers/openai.js";
-import { resolveSkillsPromptForRun } from "../../../skills/loading/workspace.js";
-import { resolveEmbeddedRunSkillEntries } from "../../../skills/runtime/embedded-run-entries.js";
-import { buildTrajectoryArtifacts } from "../../../trajectory/metadata.js";
-// ... 共导入 70+ 个模块
-```
+// src/agents/embedded-agent-runner/run/attempt.ts
+// 获取会话写锁——同一会话不能有两个并发 Attempt
+const sessionWriteLock = await acquireSessionWriteLock(sessionKey, {
+  timeout: resolveAgentTimeoutMs(runtimeConfig),  // 超时后强制释放
+  abortSignal,
+});
 
-这 70+ 个直接导入体现了 attempt.ts 的"总装车间"角色——它不实现具体逻辑，而是调度所有子系统协同工作。
-
----
-
-## 一次完整的 Agent 执行流程
-
-### 阶段 1：准备阶段
-
-```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-// 1. 获取写锁（防止并发写入同一会话）
-const sessionWriteLock = await acquireSessionWriteLock(sessionKey);
-
-// 2. 解析运行时配置
+// 解析运行时配置快照（整个 Attempt 期间使用同一快照，不受热重载影响）
 const runtimeConfig = getRuntimeConfig();
 
-// 3. 加载 Skills（用户自定义行为注入）
-const skillsPrompt = await resolveSkillsPromptForRun({
-  config: runtimeConfig,
-  sessionKey,
-  agentDir,
-});
-
-// 4. 解析上下文引擎
-const contextEngineOwnerId = resolveContextEngineOwnerPluginId();
+// 检查 ACP 运行时是否可用（是否有外部 Agent 如 Codex 已连接）
+const acpAvailable = await isAcpRuntimeSpawnAvailable(runtimeConfig);
 ```
 
-### 阶段 2：系统 Prompt 组装
+**会话写锁的必要性**：用户同时从 Telegram 和 Discord 发消息，两个 Attempt 并发写入同一 JSONL 文件会导致数据竞争。写锁确保同一会话的 Attempt 串行执行。
 
-Agent 执行引擎会从多个来源组装系统 Prompt：
-
-```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-const systemPromptParams = await buildSystemPromptParams({
-  config: runtimeConfig,
-  sessionKey,
-  agentDir,
-  // 注入来源：
-  // - 基础系统 Prompt（硬编码的能力描述）
-  // - Skills（用户自定义 .md 文件）
-  // - 插件系统 Prompt 贡献
-  // - Provider 特定的 Prompt 扩展
-  // - 子 Agent 活跃上下文
-  // - 心跳摘要（heartbeat summary）
-  skillsPrompt,
-});
-```
-
-Prompt 来源的优先级和组合方式在 `src/agents/system-prompt-params.ts` 中定义。
-
-### 阶段 3：上下文组装（Context Engine）
+### 阶段 2：上下文装配（Context Engine.assemble）
 
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
 // 调用可插拔的上下文引擎
 const assembleResult: AssembleResult = await contextEngine.assemble({
   sessionId,
   sessionKey,
   messages: sessionMessages,
   tokenBudget: resolvedTokenBudget,
-  availableTools: toolNameSet,
-  prompt: userPrompt,
+  availableTools: toolNameSet,   // 传入工具列表，引擎可据此调整提示
+  model: resolvedModel,           // 按模型调整上下文窗口策略
+  prompt: userPrompt,             // 当前 prompt（支持 RAG 引擎）
+  citationsMode,
 });
+// 返回：压缩后的消息列表 + tokenBudget 建议 + 可选的 systemPromptAddition
 ```
 
-上下文引擎是可插拔的（`ContextEngine` 接口），默认实现会根据 token 预算截断历史消息；插件可以提供向量检索等高级上下文管理策略。
+`tokenBudget` 是动态的——Runtime 根据模型上下文窗口大小、已用 token 等因素计算，传给引擎用于截断决策。
 
-### 阶段 4：工具注册
+### 阶段 3：System Prompt 组装
 
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-// 聚合多来源的工具定义：
-// 1. 内置工具（Bash、Read、Write、Edit 等）
-const builtinTools = createOpenClawCodingTools({ config: runtimeConfig, ... });
+// System Prompt 的多来源合并
+const finalSystemPrompt = [
+  baseSystemPrompt,              // 硬编码的能力描述和约束
+  skillsPrompt,                  // 用户 Skill 文件（.md）
+  heartbeatSummary,              // 后台心跳任务的摘要（如有）
+  assembleResult.systemPromptAddition,  // Context Engine 注入的额外指令
+  subagentContextAddition,       // 子 Agent 活跃上下文提示（如有）
+  memoryFileContent,             // MEMORY.md 内容（如有）
+].filter(Boolean).join("\n\n");
+```
 
-// 2. 插件贡献的工具
+### 阶段 4：工具注册与冲突检查
+
+```typescript
+// 4 类来源的工具合并
+const builtinTools = createOpenClawCodingTools({ config, session, sandbox });
+// → Bash · Read · Write · Edit · Grep · LS · Find · NotebookEdit · WebFetch ...
+
 const pluginTools = resolvePluginTools({ snapshot: pluginMetadataSnapshot });
+// → 插件注册的工具（如 ImageGeneration · VideoGeneration...）
 
-// 3. MCP 工具（通过 Bundle MCP）
 const mcpTools = await materializeBundleMcpToolsForRun({ sessionKey });
+// → Bundle MCP 服务器暴露的工具
 
-// 4. 客户端工具（Skills 定义的工具）
 const clientTools = toClientToolDefinitions(skillEntries);
+// → Skill 文件中定义的工具（客户端侧工具）
 
-// 5. 工具冲突检查
+// 工具名冲突检查（防止 Skill 定义的工具名遮蔽内置工具）
 const conflicts = findClientToolNameConflicts(clientTools, builtinTools);
 if (conflicts.length > 0) {
   throw createClientToolNameConflictError(conflicts);
@@ -152,147 +105,186 @@ if (conflicts.length > 0) {
 ### 阶段 5：LLM 流式调用
 
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-// 注册 Provider 流（根据配置选择 Anthropic/OpenAI/Google 等）
+// 根据 RuntimePlan 选择 Provider 和传输方式
 const streamFn = registerProviderStreamForModel({
   model: resolvedModel,
   config: runtimeConfig,
   providerHandle: providerRuntimeHandle,
+  transport: runtimePlan.transport,  // "sse" | "websocket" | "auto"
 });
 
-// 流式调用 LLM
-for await (const event of streamFn({
-  messages: assembleResult.messages,
-  systemPrompt: finalSystemPrompt,
-  tools: normalizedTools,
-  maxTokens: ...,
-})) {
-  // 处理流式事件：文本片段、工具调用、停止原因等
-  if (event.type === "text_delta") { /* 流式发送到通道 */ }
-  if (event.type === "tool_use") { /* 执行工具调用 */ }
-  if (event.type === "end") { /* 收集使用量、结束 */ }
+// 流式调用，处理每个事件
+for await (const event of streamFn({ messages, systemPrompt, tools, maxTokens })) {
+  switch (event.type) {
+    case "text_delta":
+      // 实时推送到通道（通过草稿输出机制）
+      await streamTextToChannel(event.delta);
+      break;
+    case "tool_use":
+      // 进入工具执行阶段（阶段 6）
+      pendingToolCalls.push(event);
+      break;
+    case "end":
+      // 收集 token 使用量
+      tokenUsage = event.usage;
+      break;
+  }
 }
 ```
 
 ### 阶段 6：工具执行循环
 
-当 LLM 返回工具调用时，执行引擎会：
+```typescript
+// 工具调用循环：直到 LLM 不再请求工具为止
+while (pendingToolCalls.length > 0) {
+  const toolResults: ToolResult[] = [];
 
-1. 验证工具名称是否在已注册工具列表中
-2. 调用对应工具的执行函数
-3. 将工具结果追加到消息历史
-4. 重新调用 LLM（携带工具结果）
-5. 重复直到 LLM 不再请求工具调用
+  for (const toolCall of pendingToolCalls) {
+    // 工具策略检查（Policy → Approval → Sandbox）
+    const policyDecision = await resolveToolCallPolicy(toolCall, {
+      isSubagent,
+      sandboxMode,
+      execApprovals,
+    });
 
-### 阶段 7：会话持久化
+    if (policyDecision.kind === "deny") {
+      toolResults.push(buildDeniedToolResult(toolCall, policyDecision.reason));
+      continue;
+    }
+
+    // 执行工具（可能在沙盒中）
+    const result = await executeToolCall(toolCall, sandboxContext);
+    toolResults.push(result);
+  }
+
+  // 将工具结果追加到消息历史，重新调用 LLM
+  messages = [...messages, buildAssistantMessage(pendingToolCalls), ...toolResults];
+  pendingToolCalls = await callLlmAgain(messages);
+}
+```
+
+### 阶段 7：持久化与后置处理
 
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-// 将本次执行的消息追加到会话存储
-await updateSessionStoreEntry({
-  sessionKey,
-  newMessages: turnMessages,
-  transcriptFile: sessionFile,
-});
+// 将本次 Attempt 的消息追加到 JSONL 文件（追加写入，不覆盖）
+await appendJsonlEntriesSync(sessionFile, turnMessages.map(serializeJsonlEntry));
 
-// 触发上下文引擎的 afterTurn 生命周期
+// 触发 Context Engine 后置生命周期
 await contextEngine.afterTurn({
   sessionId,
   messages: turnMessages,
   prePromptMessageCount,
   tokenBudget: resolvedTokenBudget,
+  autoCompactionSummary,
+  runtimeContext,
 });
+
+// 释放写锁
+sessionWriteLock.release();
+
+// 触发 Plugin Hooks（onAfterAttempt 等）
+await runPluginHooks("onAfterAttempt", { sessionKey, result });
+```
+
+---
+
+## 会话写锁的实现细节
+
+写锁基于会话 Key 的 Promise 队列：
+
+```typescript
+// 简化的写锁逻辑
+const lockMap = new Map<string, Promise<void>>();
+
+async function acquireSessionWriteLock(sessionKey: string, opts: LockOptions) {
+  const prev = lockMap.get(sessionKey) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((res) => { release = res; });
+  // 将当前锁排在上一个锁之后
+  lockMap.set(sessionKey, prev.then(() => next));
+  // 等待上一个锁释放
+  await Promise.race([prev, timeoutPromise(opts.timeout)]);
+  return { release };
+}
+```
+
+这个实现保证了同一 `sessionKey` 的 Attempt 严格串行，而不同 `sessionKey` 的 Attempt 可以并发。
+
+---
+
+## 子 Agent 支持
+
+当 Agent 被要求派生子 Agent 时，attempt.ts 通过以下机制协调：
+
+```typescript
+// 子 Agent 检测
+const isSubagent = isSubagentEnvelopeSession(sessionKey);
+// → sessionKey 包含 ":sub:" 标记时为子 Agent
+
+// 子 Agent 的活跃上下文注入到 System Prompt
+const subagentContextAddition = buildActiveSubagentSystemPromptAddition({
+  parentSessionKey,
+  activeSubagents,
+});
+
+// 子 Agent 工具封禁（不可配置覆盖）
+const toolPolicy = resolveAgentToolPolicy({
+  isSubagent: true,
+  // → 自动封禁 SUBAGENT_TOOL_DENY_ALWAYS
+});
+```
+
+---
+
+## 心跳机制（Heartbeat）
+
+Agent 支持后台定时心跳运行，无需用户触发：
+
+```typescript
+// 心跳标志注入
+const heartbeatSummary = await resolveHeartbeatSummaryForAgent({ config, sessionKey });
+
+// 心跳的 System Prompt 附加内容
+const heartbeatSystemPromptAddition = resolveHeartbeatPromptForSystemPrompt({
+  heartbeatSchedule,
+  heartbeatSummary,
+});
+
+// 心跳 Attempt 与普通 Attempt 共用相同执行路径
+// 区别：isHeartbeat=true → afterTurn/ingest 传递此标志
 ```
 
 ---
 
 ## 轨迹记录（Trajectory）
 
-OpenClaw 支持记录 Agent 执行轨迹，用于调试和分析：
-
 ```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-const trajectoryRecorder = createTrajectoryRuntimeRecorder({
-  sessionKey,
-  config: runtimeConfig,
-});
-
-// 执行结束后构建轨迹产物
+// 记录 Agent 执行轨迹，用于调试和分析
 const trajectoryArtifacts = await buildTrajectoryArtifacts({
   sessionKey,
-  runMetadata: buildTrajectoryRunMetadata({...}),
+  runMetadata: buildTrajectoryRunMetadata({
+    model: resolvedModel,
+    provider: resolvedProvider,
+    thinkingLevel: runtimePlan.thinkingLevel,
+    tokenUsage,
+    durationMs: Date.now() - startedAt,
+  }),
   messages: turnMessages,
   toolDefinitions: toTrajectoryToolDefinitions(normalizedTools),
 });
 ```
 
----
-
-## 沙盒机制
-
-Agent 执行工具（如 Bash 命令）时，会根据配置决定是否在沙盒中运行：
-
-```typescript
-// 文件路径：src/agents/sandbox.ts
-export async function resolveSandboxContext(
-  config: OpenClawConfig,
-  agentDir: string,
-): Promise<SandboxContext> {
-  const sandboxConfig = resolveSandboxConfigForAgent(config, agentDir);
-  return {
-    mode: sandboxConfig.mode,   // "none" | "docker" | "bwrap" | "macOS-sandbox"
-    workdir: agentDir,
-    // ...
-  };
-}
-```
-
-沙盒支持 Docker、Linux bubblewrap、macOS Sandbox 等多种隔离方案。
-
----
-
-## 子 Agent（Subagent）支持
-
-OpenClaw 支持 Agent 嵌套执行（即 Agent 派生子 Agent）：
-
-```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-import {
-  buildActiveSubagentSystemPromptAddition,
-} from "../../subagent-active-context.js";
-
-import {
-  isSubagentEnvelopeSession,
-  resolveSubagentCapabilityStore,
-} from "../../subagent-capabilities.js";
-```
-
-子 Agent 会话使用独立的 `sessionKey`，通过 `isSubagentSessionKey()` 区分。父 Agent 的活跃上下文会注入到子 Agent 的系统 Prompt 中，实现上下文传递。
-
----
-
-## 心跳机制（Heartbeat）
-
-Agent 支持后台心跳运行，在无用户输入时执行定期任务：
-
-```typescript
-// 文件路径：src/agents/embedded-agent-runner/run/attempt.ts
-import { resolveHeartbeatSummaryForAgent } from "../../../infra/heartbeat-summary.js";
-import { resolveHeartbeatPromptForSystemPrompt } from "../../heartbeat-system-prompt.js";
-import { filterHeartbeatTranscriptArtifacts } from "../../../auto-reply/heartbeat-filter.js";
-```
-
-心跳运行与普通用户触发的运行共享相同的 attempt.ts 执行路径，但通过 `isHeartbeat` 标志区分处理逻辑。
+轨迹文件保存在 `~/.openclaw/trajectories/` 目录，可用于复盘 Agent 决策过程。
 
 ---
 
 ## 小结
 
-1. `attempt.ts`（5,377 行）是整个 Agent 引擎的核心，以"总装车间"模式编排 70+ 个子系统
-2. 执行流程分 7 个阶段：准备 → Prompt 组装 → 上下文装配 → 工具注册 → LLM 调用 → 工具循环 → 持久化
-3. 上下文引擎是可插拔的接口，默认按 token 预算截断，插件可实现向量检索等高级策略
-4. 工具来源有 4 类：内置、插件、MCP、Skills（客户端）；启动时做冲突检查
-5. 子 Agent 嵌套和心跳机制复用同一执行路径，通过标志位区分
+1. **总装车间模式**：attempt.ts 不实现逻辑，只按顺序调用 70+ 个子系统——这使每个子系统可以独立测试
+2. **会话写锁**：基于 Promise 队列，保证同一会话串行、不同会话并发，是多通道安全的基石
+3. **工具 4 类来源**：内置 + 插件 + MCP + Skill（客户端）——注册时做名称冲突检查，防止 Skill 遮蔽内置工具
+4. **子 Agent 和心跳复用同一路径**：通过 `isSubagent` 和 `isHeartbeat` 标志区分，不需要独立代码路径
+5. **后置处理链**：`afterTurn` → 写锁释放 → Plugin Hooks，顺序有意义——确保 Context Engine 在锁释放前完成状态更新
 
 ## 延伸阅读
 
