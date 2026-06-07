@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-code-analysiswiki-docs",
+  "version": "1.0.0",
+  "description": "OpenClaw 源码分析阅读站",
+  "type": "module",
+  "scripts": {
+    "docs:build": "node build.js",
+    "docs:preview": "npx serve dist"
+  },
+  "devDependencies": {
+    "marked": "^12.0.0"
+  }
+}
