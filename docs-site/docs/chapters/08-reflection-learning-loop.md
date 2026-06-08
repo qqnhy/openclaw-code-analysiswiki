@@ -145,33 +145,162 @@ sequenceDiagram
 
 ---
 
-## Dreaming 作为隐式学习循环
+## Dreaming 三阶段源码精确解析
 
-```mermaid
-graph LR
-    subgraph "运行时（实时）"
-        A["Agent 执行\n写入新记忆"]
-        B["短期记忆\nSession JSONL"]
-    end
+OpenClaw 的 Dreaming 系统模拟了人类睡眠记忆巩固的三个阶段，由 `extensions/memory-core/src/dreaming.ts` 和 `dreaming-phases.ts` 共同实现。
 
-    subgraph "Dreaming（后台）"
-        C["短期 → 长期促进\nshort-term-promotion.ts"]
-        D["记忆整合\ndreaming.ts"]
-        E["概念词汇更新\nconcept-vocabulary.ts"]
-        F["Shadow Trial\n质量评估"]
-    end
+### 触发机制（dreaming.ts:496）
 
-    subgraph "下次运行"
-        G["记忆检索\n注入 System Prompt"]
-        H["Agent 行为改变\n（间接学习）"]
-    end
-
-    A --> B --> C --> D --> E --> F
-    F -->|通过| G --> H
-    F -->|失败| D
+```typescript
+// dreaming.ts:505 — 只响应 heartbeat 和 cron 触发
+export async function runShortTermDreamingPromotionIfTriggered(params: {
+  cleanedBody: string;
+  trigger?: string;        // "heartbeat" | "cron"
+  workspaceDir?: string;
+  config: ShortTermPromotionDreamingConfig;
+  // ...
+}): Promise<{ handled: true; reason: string } | undefined> {
+  if (params.trigger !== "heartbeat" && params.trigger !== "cron") {
+    return undefined;
+  }
+  // 检查 system event token 是否注入到消息体中
+  if (!includesSystemEventToken(params.cleanedBody, DREAMING_SYSTEM_EVENT_TEXT)) {
+    return undefined;
+  }
+  // ...
+  // cron 触发时叙事生成异步执行，heartbeat 触发时同步
+  const detachNarratives = params.trigger === "cron";
 ```
 
-Dreaming 是 OpenClaw 最接近"学习"的机制：通过整合记忆、更新概念词汇，Agent 的"知识库"会随时间优化，下次执行时获取到更高质量的记忆片段，间接改变行为。
+### Phase 1 — Light Sleep（dreaming-phases.ts:1629）
+
+Light 阶段是"浅睡"，负责**信号摄取和近期记忆排序**：
+
+```typescript
+async function runLightDreaming(params): Promise<void> {
+  // 1. 摄取每日 MEMORY.md 文件中的记忆信号
+  await ingestDailyMemorySignals({ workspaceDir, lookbackDays, limit, nowMs });
+
+  // 2. 摄取 Session Transcript 中的对话信号
+  await ingestSessionTranscriptSignals({ workspaceDir, cfg, lookbackDays, nowMs });
+
+  // 3. 按最后召回时间 + 召回次数排序，去重
+  const entries = dedupeEntries(
+    recentEntries.toSorted((a, b) =>
+      Date.parse(b.lastRecalledAt) - Date.parse(a.lastRecalledAt) || b.recallCount - a.recallCount
+    ).slice(0, params.config.limit),
+    params.config.dedupeSimilarity,
+  );
+
+  // 4. 写入当日 Dreaming Phase 块（phase: "light"）
+  await writeDailyDreamingPhaseBlock({ workspaceDir, phase: "light", bodyLines, nowMs });
+
+  // 5. 生成叙事日记（同步或异步取决于 detachNarratives）
+  if (params.subagent && capped.length > 0) {
+    await generateAndAppendDreamNarrative({ data: { phase: "light", snippets, themes } });
+  }
+}
+```
+
+摄取分数常量：
+- `DAILY_INGESTION_SCORE = 0.62`（每日记忆文件的基础分数）
+- `SESSION_INGESTION_SCORE = 0.58`（会话转录的基础分数）
+- `SESSION_INGESTION_MAX_MESSAGES_PER_SWEEP = 240`（每次最多摄取的消息数）
+
+### Phase 2 — REM Sleep（dreaming-phases.ts:1728）
+
+REM 阶段优先处理 Light 阶段已暂存的记忆，形成 **Light→REM 流水线**：
+
+```typescript
+async function runRemDreaming(params): Promise<void> {
+  // 1. 读取 Light 阶段已暂存的 key
+  const lightKeys = await readLightStagedKeys({ workspaceDir, nowMs });
+
+  // 2. 优先使用 Light 暂存条目（而非全量扫描），实现 Light→REM 流水线
+  // dreaming-phases.ts:1762: "Prefer entries staged by light sleep so REM
+  //   synthesises from the sequential light→REM pipeline instead of rescanning the full store."
+  const stagedEntries = lightKeys.size > 0
+    ? allEntries.filter(entry => lightKeys.has(entry.key))
+    : [];
+  const entries = stagedEntries.length > 0 ? stagedEntries : allEntries;
+
+  // 3. 基于 minPatternStrength 进行模式强度分析
+  const preview = previewRemDreaming({ entries, limit, minPatternStrength });
+
+  // 4. 写入 REM 阶段块 + 记录 REM 考量信号
+  await writeDailyDreamingPhaseBlock({ workspaceDir, phase: "rem", bodyLines: preview.bodyLines });
+  await recordRemConsideredPhaseSignals({ workspaceDir, keys: stagedEntries.map(e => e.key) });
+}
+```
+
+REM 触发的系统事件 token（dreaming-phases.ts:88）：
+```
+const REM_SLEEP_EVENT_TEXT = "__openclaw_memory_core_rem_sleep__"
+```
+
+### Phase 3 — 短期记忆促进（dreaming.ts:593）
+
+最终阶段将高质量短期记忆**提升为长期记忆**（写入 `MEMORY.md`）：
+
+```typescript
+// 1. 修复召回产物中的格式问题
+const repair = await repairShortTermPromotionArtifacts({ workspaceDir });
+
+// 2. 按加权分数排名候选记忆
+const candidates = await rankShortTermPromotionCandidates({
+  workspaceDir,
+  limit: params.config.limit,
+  // 过滤阈值（配置参数）：
+  // minScore         — 最低召回分数（0.0–1.0）
+  // minRecallCount   — 最低被召回次数
+  // minUniqueQueries — 最低触发的不同查询数
+  // recencyHalfLifeDays — 时间衰减半衰期（天）
+  // maxAgeDays       — 最大记忆年龄（天）
+});
+
+// 3. 执行提升：将候选写入 MEMORY.md 长期记忆
+const applied = await applyShortTermPromotions({ workspaceDir, candidates });
+```
+
+### 完整 Dreaming 数据流图
+
+```mermaid
+graph TB
+    subgraph "触发（heartbeat / cron）"
+        T["runShortTermDreamingPromotionIfTriggered\ndreaming.ts:496"]
+    end
+
+    subgraph "Phase 1 — Light Sleep\ndreaming-phases.ts:1629"
+        L1["ingestDailyMemorySignals()"]
+        L2["ingestSessionTranscriptSignals()"]
+        L3["dedupeEntries() + 按时间/召回次数排序"]
+        L4["writeDailyDreamingPhaseBlock(phase='light')"]
+        L5["generateAndAppendDreamNarrative()\n[同步/异步取决于 trigger 类型]"]
+    end
+
+    subgraph "Phase 2 — REM Sleep\ndreaming-phases.ts:1728"
+        R1["readLightStagedKeys()\n优先取 Light 暂存条目"]
+        R2["previewRemDreaming()\n模式强度分析"]
+        R3["writeDailyDreamingPhaseBlock(phase='rem')"]
+        R4["recordRemConsideredPhaseSignals()"]
+    end
+
+    subgraph "Phase 3 — 短期→长期提升\ndreaming.ts:593"
+        P1["repairShortTermPromotionArtifacts()"]
+        P2["rankShortTermPromotionCandidates()\n加权分数过滤"]
+        P3["applyShortTermPromotions()\n写入 MEMORY.md"]
+    end
+
+    T --> L1 --> L2 --> L3 --> L4 --> L5
+    L5 --> R1 --> R2 --> R3 --> R4
+    R4 --> P1 --> P2 --> P3
+
+    P3 -->|"下次 Agent 运行\n记忆检索注入 Prompt"| EFFECT["Agent 行为间接改变\n（隐式学习）"]
+```
+
+## Dreaming 作为隐式学习循环
+
+Dreaming 是 OpenClaw 最接近"学习"的机制。它模拟人类睡眠的三个阶段（Light→REM→Promotion）：通过摄取信号、模式分析、加权提升，Agent 的"知识库"随时间优化，下次执行时获得更高质量的记忆片段，**间接改变行为**——这是隐式 Reflection，而非显式自我评估。
 
 ---
 

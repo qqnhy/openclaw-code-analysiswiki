@@ -231,6 +231,37 @@ sequenceDiagram
 
 ---
 
+## packages/ 完整模块清单（基于源码）
+
+OpenClaw 的 `packages/` 目录包含 20 个独立 TS 包，每个包都有明确的职责边界：
+
+| 包名 | 核心职责 | 关键类型/函数 |
+|---|---|---|
+| **agent-core** | Agent 主循环、Harness、类型定义 | `CoreAgentHarness`、`agentLoop()`、`AgentTool` |
+| **llm-core** | LLM 类型定义、EventStream 抽象 | `StreamFn`、`Model`、`Context`、`EventStream` |
+| **llm-runtime** | LLM 流式调用实现、Provider 路由 | `resolveStreamFn()`、运行时 Provider 注册 |
+| **sdk** | 对外公开 SDK 入口 | `openclaw/sdk` 的统一 re-export |
+| **plugin-sdk** | 插件开发公开合约 | `OpenClawPluginApi`、`PluginEntry` |
+| **plugin-package-contract** | 插件包 manifest 结构合约 | `openclaw.plugin.json` 类型定义 |
+| **memory-host-sdk** | 向量记忆 SQLite + sqlite-vec 接口 | `MemoryEngine`、`hybridSearch()` |
+| **model-catalog-core** | 模型目录、能力注册 | `ModelCatalog`、模型 cap 类型 |
+| **gateway-protocol** | Gateway WebSocket/HTTP 协议定义 | 协议消息类型、帧格式 |
+| **gateway-client** | Gateway 客户端 SDK | 客户端连接、事件监听 |
+| **markdown-core** | Markdown 解析、frontmatter 处理 | Skill 加载器的底层依赖 |
+| **media-core** | 媒体类型抽象（图像/音频/视频） | `MediaAttachment` 统一接口 |
+| **media-generation-core** | AI 生成媒体（文生图等）抽象 | 图像/视频生成能力接口 |
+| **media-understanding-common** | 多模态理解通用工具 | 媒体理解能力共享类型 |
+| **speech-core** | 语音 TTS/ASR 抽象层 | `SpeechEngine`、TTS/ASR 统一接口 |
+| **terminal-core** | 终端渲染、TUI 组件 | 命令行交互组件 |
+| **normalization-core** | 消息标准化工具（跨 Provider） | 消息格式归一化 |
+| **net-policy** | 网络访问策略控制 | 白名单、代理、网络隔离规则 |
+| **acp-core** | ACP 协议核心（Agent Communication Protocol） | ACP 消息类型、桥接合约 |
+| **tool-call-repair** | 工具调用格式修复（LLM 幻觉校正） | 修复格式错误的 JSON tool call |
+
+> **设计原则**：`packages/` 之间只允许向上依赖（`agent-core` 依赖 `llm-core`，反之不行）。`extensions/` 只能通过 `packages/plugin-sdk` 的公开接口与 Core 交互，不能直接 import `packages/agent-core/src/**` 内部模块。
+
+---
+
 ## 扩展点（Extension Points）
 
 1. **新 LLM Provider**：实现 `StreamFn` 类型函数，通过 `extensions/` 注册。入口参考 `extensions/anthropic/index.ts`。
